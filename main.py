@@ -1,0 +1,688 @@
+"""
+Polymarket Alpha Intelligence Engine v2 - orchestrator.
+
+Runtime flow (matches the architecture doc):
+  1. Ingest market data across categories + Kalshi + closed-events (free-tier
+     historical data) - all free, always.
+  2. Detect mispricing signals directly from raw market data (free: arbitrage
+     + Kalshi cross-platform; conditionally paid: LLM-estimate fallback,
+     disabled by default).
+  3. For each candidate signal (there are usually few): fetch its order book,
+     compute market features, run verification (free-tier-first) and
+     historical precedent (free-tier-first), evaluate any relevant tracked
+     wallets, and build a full MarketIntelligenceReport.
+  4. Decide BUY_YES / BUY_NO / MONITOR / NO_TRADE via intelligence/decision_engine.
+  5. Alert on Discord if thresholds are met.
+  6. Periodically (every WALLET_SCAN_EVERY_N_RUNS cycles): scan the
+     leaderboard for new qualifying wallets, build their full dossier via
+     wallet_intel/*, alert on newly-discovered ones.
+
+Usage:
+    python main.py                    # one-off scan
+    python main.py --loop             # continuous (Railway worker mode)
+    python main.py --wallet-scan      # force the wallet scan on a one-off run
+"""
+
+import argparse
+import sys
+import time
+from datetime import datetime, timezone
+
+import storage.db as db
+from config.loader import (
+    market_categories, risk as risk_cfg, discord as discord_cfg,
+    wallet_scoring as ws_cfg, SCAN_INTERVAL_SECONDS, MAX_KALSHI_PER_SCAN,
+    WALLET_SCAN_EVERY_N_RUNS,
+)
+from config.cost_profile import print_startup_report
+
+from ingestion.polymarket_api import fetch_events_by_categories, fetch_closed_events
+from ingestion.category_resolver import resolve_category_tag_ids
+from ingestion.external_sources_kalshi import fetch_open_markets as fetch_kalshi_markets
+from ingestion.orderbook_stream import fetch_book, compute_spread_and_depth
+from ingestion.wallet_activity import (
+    fetch_leaderboard, fetch_wallet_trade_summary, fetch_wallet_activity_detailed,
+    fetch_wallet_closed_positions, fetch_wallet_open_positions,
+)
+from ingestion.http_utils import ApiError
+
+from features.market_features import compute_market_features
+from features.wallet_features import compute_wallet_features, category_performance
+from features.behavior_features import compute_behavior_features
+
+from mispricing.edge_detector import detect_arbitrage, detect_cross_platform_edges
+from mispricing.probability_model import find_best_kalshi_candidate
+from mispricing.signal_ranker import rank_signals
+
+from mispricing.probability_model import title_similarity
+from intelligence.market_intelligence_builder import build_report
+from wallet_intel.copy_trade_filter import evaluate_wallet
+from wallet_intel.address_safety import is_system_contract
+from wallet_intel.wallet_classifier import classify_activity_pattern
+from wallet_intel.report_formatter import render_wallet_report
+from wallet_intel.transaction_explainer import explain_recent_trades, get_event_cached
+from wallet_intel.strategy_drift import analyze_strategy_drift
+from strategy_learning.contrarian_win_finder import find_contrarian_big_win
+from strategy_learning.contrarian_alert_formatter import send_contrarian_win_alert
+
+from alerts.alert_payload_builder import build_payload
+from alerts.discord_formatter import send_market_alert, send_wallet_alert
+
+MAX_SIGNALS_PROCESSED_PER_RUN = 20  # caps the expensive per-signal work (order book, verification)
+
+
+def run_scan(categories: list, max_per_category: int, max_kalshi: int, include_wallet_scan: bool = False):
+    db.init_db()
+    run_id = db.start_run()
+
+    print(f"[run {run_id}] Fetching Polymarket events across categories: "
+          f"{', '.join(categories)} (up to {max_per_category} each)...")
+    tag_map = resolve_category_tag_ids(categories)
+    resolved_names = sorted(tag_map.keys())
+    missing_names = sorted(set(categories) - set(tag_map.keys()))
+    print(f"[run {run_id}] Resolved {len(resolved_names)}/{len(categories)} categories to real tag IDs: "
+          f"{resolved_names}" + (f" | UNRESOLVED (skipped): {missing_names}" if missing_names else ""))
+    try:
+        events = fetch_events_by_categories(categories, max_per_category, tag_map=tag_map)
+    except ApiError as e:
+        print(f"FAILED to fetch Polymarket events: {e}", file=sys.stderr)
+        return
+    print(f"[run {run_id}] Retrieved {len(events)} events.")
+
+    if risk_cfg.enable_kalshi_cross_platform:
+        print(f"[run {run_id}] Fetching Kalshi markets (limit={max_kalshi})...")
+        try:
+            kalshi_markets = fetch_kalshi_markets(max_markets=max_kalshi)
+        except ApiError as e:
+            print(f"WARNING: Kalshi fetch failed: {e}", file=sys.stderr)
+            kalshi_markets = []
+        print(f"[run {run_id}] Retrieved {len(kalshi_markets)} Kalshi markets.")
+    else:
+        kalshi_markets = []
+        print(f"[run {run_id}] Kalshi cross-platform matching disabled (risk.enable_kalshi_cross_platform=false) "
+              f"- Polymarket-only data sources per Phase 1 restriction.")
+
+    print(f"[run {run_id}] Fetching closed events for historical precedent (free tier)...")
+    try:
+        closed_events = fetch_closed_events(max_events=max_per_category * len(categories))
+    except ApiError as e:
+        print(f"WARNING: closed-events fetch failed: {e}", file=sys.stderr)
+        closed_events = []
+    print(f"[run {run_id}] Retrieved {len(closed_events)} closed events.")
+
+    poly_market_count = sum(len(e["markets"]) for e in events)
+
+    # --- Free-tier mispricing detection (arbitrage always on; Kalshi cross-platform gated by risk.enable_kalshi_cross_platform) ---
+    arb_signals = detect_arbitrage(events)
+    cross_signals = detect_cross_platform_edges(events, kalshi_markets) if risk_cfg.enable_kalshi_cross_platform else []
+    all_signals = rank_signals(arb_signals + cross_signals, top_n=MAX_SIGNALS_PROCESSED_PER_RUN)
+    _print_coverage_diagnostics(events, kalshi_markets, arb_signals, cross_signals)
+    print(f"[run {run_id}] {len(arb_signals)} arbitrage signal(s), "
+          f"{len(cross_signals)} cross-platform signal(s), processing top {len(all_signals)}.")
+
+    market_lookup = {m["market_id"]: m for e in events for m in e["markets"]}
+    event_lookup = {e["event_id"]: e for e in events}
+
+    tracked_wallets = _load_tracked_wallets()
+
+    reports_built = 0
+    alerts_sent = 0
+    report_summaries = []  # for detailed per-signal logging below
+    for signal in all_signals:
+        market = market_lookup.get(signal["market_id"])
+        event = event_lookup.get(signal["market_id"])  # arbitrage signals key by event_id
+
+        if market:
+            question = market.get("question", "")
+            resolution_rule = market.get("resolution_rule", "")
+            market_title = question
+            token_ids = market.get("clob_token_ids", [])
+            book = fetch_book(token_ids[0]) if token_ids else None
+            book_stats = compute_spread_and_depth(book) if book else {}
+            m_features = compute_market_features(market, book_stats)
+        elif event:
+            question = event.get("title", "")
+            resolution_rule = ""
+            market_title = event.get("title", "")
+            # Arbitrage signals span multiple markets within this event - use
+            # real aggregated data across the neg-risk markets, not hardcoded
+            # zeros. min_liquidity is already computed by edge_detector;
+            # volume/depth are summed across the same markets that fed the
+            # arbitrage check, so this reflects genuine tradability, not a
+            # placeholder that would fail every liquidity check by construction.
+            neg_risk_markets = [m for m in event["markets"] if m.get("neg_risk")]
+            total_volume = sum(m.get("volume_24h", 0.0) for m in neg_risk_markets)
+            min_liquidity = signal.get("_min_liquidity", 0.0)
+            m_features = {
+                "liquidity_usd": min_liquidity,
+                "volume_24h_usd": total_volume,
+                "depth_usd": min_liquidity,  # no live order book for a basket - liquidity is the honest proxy
+                "time_to_resolution_days": None,
+            }
+        else:
+            continue  # signal references a market/event we no longer have - skip safely
+
+        category = _infer_category(market_title, events)
+        relevant_wallets = _find_relevant_wallets(market_title, tracked_wallets)
+
+        report = build_report(
+            mispricing_signal=signal, market_features=m_features,
+            market_question=question, resolution_rule=resolution_rule,
+            market_category=category, closed_events=closed_events,
+            wallet_evaluations=relevant_wallets,
+        )
+        db.save_record(run_id, "MarketIntelligenceReport", report, market_id=signal["market_id"])
+        reports_built += 1
+
+        will_alert = _should_alert(report, signal)
+        alert_reason = ""
+        if not will_alert:
+            if report["decision_label"] not in ("BUY_YES", "BUY_NO"):
+                alert_reason = f"decision={report['decision_label']} (not a trade call)"
+            else:
+                alert_reason = (
+                    f"edge {signal.get('edge_size', 0)*100:.1f}pp below alert "
+                    f"threshold {discord_cfg.alert_min_deviation*100:.1f}pp"
+                )
+
+        report_summaries.append({
+            "title": market_title[:80], "signal_type": signal.get("signal_type"),
+            "edge_pp": signal.get("edge_size", 0.0) * 100,
+            "decision": report["decision_label"], "confidence": report.get("confidence_tier"),
+            "will_alert": will_alert, "skip_reason": alert_reason,
+        })
+
+        if will_alert:
+            payload = build_payload(report, wallet_profiles=relevant_wallets)
+            db.save_record(run_id, "DiscordAlertPayload", payload, market_id=signal["market_id"])
+            if send_market_alert(payload):
+                alerts_sent += 1
+
+    db.finish_run(run_id, len(events), poly_market_count, len(kalshi_markets))
+    _print_report_details(run_id, report_summaries)
+    _print_summary(run_id, events, kalshi_markets, all_signals, reports_built, alerts_sent)
+
+    if include_wallet_scan:
+        _run_wallet_scan(run_id, events, closed_events)
+    else:
+        print(f"\n[run {run_id}] Wallet scan skipped this cycle "
+              f"(runs every {WALLET_SCAN_EVERY_N_RUNS} cycles - use --wallet-scan to force it).")
+
+
+def _should_alert(report: dict, signal: dict) -> bool:
+    if report["decision_label"] not in ("BUY_YES", "BUY_NO"):
+        return False
+    return signal.get("edge_size", 0.0) >= discord_cfg.alert_min_deviation
+
+
+def _infer_category(market_title: str, events: list) -> str:
+    for e in events:
+        if e.get("title") == market_title or any(m.get("question") == market_title for m in e["markets"]):
+            return e.get("category", "unknown")
+    return "unknown"
+
+
+def _load_tracked_wallets() -> list:
+    """Pulls previously-discovered wallet candidates from the DB for
+    market-level relevance matching (does this market overlap a tracked
+    wallet's known top events)."""
+    with db.get_conn() as conn:
+        rows = conn.execute("SELECT * FROM wallet_candidates").fetchall()
+    return [dict(r) for r in rows]
+
+
+def _find_relevant_wallets(market_title: str, tracked_wallets: list, threshold: float = 0.5) -> list:
+    """
+    Approximates 'which tracked wallets are active in this market' using
+    title-similarity against each wallet's stored top_events - an honest
+    proxy given there's no free 'holders of this specific market' endpoint,
+    rather than a fabricated direct lookup.
+    """
+    import json as _json
+    relevant = []
+    for w in tracked_wallets:
+        top_events_raw = w.get("top_events")
+        try:
+            top_events = _json.loads(top_events_raw) if top_events_raw else []
+        except (ValueError, TypeError):
+            top_events = []
+        for ev in top_events:
+            if title_similarity(market_title, ev.get("event", "")) >= threshold:
+                relevant.append({**w, "direction": None})  # direction unknown without a per-market holdings call
+                break
+    return relevant
+
+
+def _run_wallet_scan(run_id: int, events: list = None, closed_events: list = None):
+    """
+    Scans the leaderboard for qualifying wallets. Two things this fixes
+    versus earlier versions:
+
+    1. Ranks by RECENT-window PnL (config: leaderboard_time_period, default
+       MONTH), not all-time - all-time ranking surfaces wallets that made a
+       fortune years ago and went dormant, which was flooding results with
+       stale wallets even though they technically passed the age/trade/PnL
+       filters.
+    2. Enforces a HARD inactivity cutoff (activity_recency.max_days_inactive,
+       default 14 days) at discovery time, using the trade-summary data
+       already fetched for the age check - no extra API calls needed. This
+       is a real exclusion, not just a recommendation downgrade - inactive
+       wallets never make it into `qualifying` at all.
+
+    The broaden-and-retry logic below only ever loosens age/trade-count/PnL
+    thresholds when too few wallets qualify - it NEVER loosens the
+    inactivity cutoff, since "must still be actively trading" is the one
+    requirement that shouldn't be negotiable just because the pool is thin.
+    """
+    target_min_wallets = 5
+    attempts = [
+        {"pool_size": ws_cfg.leaderboard_pool_size, "max_trades": ws_cfg.max_trade_count_for_selectivity,
+         "min_pnl": ws_cfg.min_pnl_usd, "min_age": ws_cfg.min_wallet_age_days},
+        {"pool_size": ws_cfg.leaderboard_pool_size * 2, "max_trades": ws_cfg.max_trade_count_for_selectivity * 2,
+         "min_pnl": ws_cfg.min_pnl_usd, "min_age": ws_cfg.min_wallet_age_days * 0.66},
+        {"pool_size": ws_cfg.leaderboard_pool_size * 4, "max_trades": ws_cfg.max_trade_count_for_selectivity * 4,
+         "min_pnl": ws_cfg.min_pnl_usd * 0.5, "min_age": ws_cfg.min_wallet_age_days * 0.33},
+    ]
+
+    event_category_map = {
+        e.get("slug"): e.get("category") for e in (events or []) if e.get("slug")
+    }
+
+    qualifying = []
+    rejection_counts = {}
+    for i, params in enumerate(attempts):
+        print(f"\n[run {run_id}] Wallet scan attempt {i+1}/{len(attempts)}: "
+              f"pool={params['pool_size']}, max_trades={params['max_trades']}, "
+              f"min_pnl=${params['min_pnl']:.0f}, min_age={params['min_age']:.0f}d, "
+              f"max_days_inactive={ws_cfg.activity_recency.max_days_inactive} (fixed, never loosened)...")
+        qualifying, rejection_counts = _scan_wallets_with_params(
+            event_category_map=event_category_map, closed_events_pool=closed_events, **params)
+        print(f"[run {run_id}] Attempt {i+1} found {len(qualifying)} qualifying wallet(s). "
+              f"Rejected: {rejection_counts}")
+        if len(qualifying) >= target_min_wallets:
+            break
+
+    if not qualifying:
+        print(f"[run {run_id}] Wallet scan: 0 wallets qualified even after broadening filters. "
+              f"Rejection breakdown: {rejection_counts}")
+        return
+
+    new_count, skipped_stale_alert = 0, 0
+    for wallet_record in qualifying:
+        is_new = db.upsert_wallet_candidate(run_id, wallet_record)
+        if is_new:
+            new_count += 1
+
+            # Strategic learning layer alert fires independently of the
+            # copy-trade recommendation below - a wallet can have one
+            # spectacular contrarian win worth studying even if its
+            # OVERALL pattern isn't copy-worthy (e.g. flagged for drift
+            # or dormancy). This is a case study, not a copy-trade signal.
+            contrarian_win = wallet_record.get("contrarian_win")
+            if contrarian_win:
+                send_contrarian_win_alert(
+                    wallet_record["wallet_address"], wallet_record.get("username"), contrarian_win
+                )
+
+            # Belt-and-suspenders: never alert on a wallet the copy_trade_filter
+            # has flagged "avoid" (which includes the dormancy override) even
+            # though the hard filter above should already exclude these.
+            if wallet_record.get("copy_trade_recommendation") == "avoid":
+                skipped_stale_alert += 1
+                continue
+            if send_wallet_alert(wallet_record):
+                print(f"  Alerted on new wallet candidate: {wallet_record.get('username') or wallet_record['wallet_address']} "
+                      f"(last active {wallet_record.get('days_since_last_trade', '?')} days ago)")
+
+    print(f"[run {run_id}] Wallet scan: {len(qualifying)} wallet(s) evaluated, {new_count} newly discovered, "
+          f"{skipped_stale_alert} skipped from alerting (flagged avoid).")
+
+
+def _scan_wallets_with_params(pool_size: int, max_trades: int, min_pnl: float, min_age: float,
+                               event_category_map: dict = None, closed_events_pool: list = None) -> tuple:
+    try:
+        leaderboard = fetch_leaderboard(pool_size=int(pool_size), time_period=ws_cfg.leaderboard_time_period)
+    except ApiError as e:
+        print(f"WARNING: leaderboard fetch failed: {e}", file=sys.stderr)
+        return [], {}
+
+    now = datetime.now(timezone.utc).timestamp()
+    results = []
+    rejected = {"pnl_too_low": 0, "no_address": 0, "trade_summary_failed": 0,
+                "too_many_trades_or_no_trades": 0, "too_new": 0, "inactive": 0,
+                "dossier_fetch_failed": 0, "system_contract": 0}
+
+    for entry in leaderboard:
+        if entry["pnl"] < min_pnl:
+            rejected["pnl_too_low"] += 1
+            continue
+        wallet = entry["wallet_address"]
+        if not wallet:
+            rejected["no_address"] += 1
+            continue
+
+        # HARD exclusion for known Polymarket system infrastructure
+        # contracts (relay hub, deposit wallet factory, pUSD, CTF) - these
+        # are shared platform contracts, not individual traders, so a win
+        # rate or PnL "score" on one of them is meaningless. This is a
+        # genuine exclusion, not a weighted penalty, since these should
+        # never legitimately appear as copy-trade candidates at all.
+        is_sys_contract, sys_label = is_system_contract(wallet)
+        if is_sys_contract:
+            rejected["system_contract"] += 1
+            print(f"  EXCLUDED (system contract, not a trader): {wallet} = {sys_label}")
+            continue
+
+        try:
+            summary = fetch_wallet_trade_summary(wallet, max_trades=int(max_trades))
+        except ApiError:
+            rejected["trade_summary_failed"] += 1
+            continue
+
+        if summary["hit_cap"] or summary["trade_count"] == 0 or summary["first_trade_ts"] is None:
+            rejected["too_many_trades_or_no_trades"] += 1
+            continue
+
+        wallet_age_days = (now - summary["first_trade_ts"]) / 86400
+        if wallet_age_days < min_age:
+            rejected["too_new"] += 1
+            continue
+
+        # HARD inactivity cutoff - uses last_trade_ts already returned by
+        # fetch_wallet_trade_summary above, no extra API call. This is the
+        # actual fix: excluded from the pool entirely, not just downgraded
+        # later. Never loosened across broaden-and-retry attempts.
+        days_since_last_trade = (now - summary["last_trade_ts"]) / 86400 if summary["last_trade_ts"] else float("inf")
+        if days_since_last_trade > ws_cfg.activity_recency.max_days_inactive:
+            rejected["inactive"] += 1
+            continue
+
+        try:
+            activity = fetch_wallet_activity_detailed(wallet, limit=max(summary["trade_count"], 1))
+            closed_positions = fetch_wallet_closed_positions(wallet)
+            open_positions = fetch_wallet_open_positions(wallet)
+        except ApiError as e:
+            print(f"WARNING: dossier fetch failed for {wallet}: {e}", file=sys.stderr)
+            rejected["dossier_fetch_failed"] += 1
+            continue
+
+        features = compute_wallet_features(wallet, activity, closed_positions, open_positions, wallet_age_days)
+        features.update(compute_behavior_features(activity))
+        features["wallet_age_days"] = round(wallet_age_days, 1)
+        features["is_system_contract"] = False  # already hard-excluded above if True - kept for completeness in the score/report
+        features["activity_pattern_label"] = classify_activity_pattern(features)
+        if event_category_map:
+            features["category_performance"] = category_performance(closed_positions, event_category_map)
+
+        # --- Phase 5: strategy consistency scoring + drift detection ---
+        drift_result = analyze_strategy_drift(activity, closed_positions, event_category_map=event_category_map)
+        features["drift_result"] = drift_result
+
+        # --- Phase 2: non-negotiable hard wallet filters ---
+        hf_cfg = ws_cfg.hard_filters
+        trades_per_week_recent = features.get("trade_count_28d", 0) / 4.0
+        if trades_per_week_recent < hf_cfg.min_trades_per_week_recent:
+            rejected["hf_not_enough_recent_trades_per_week"] = rejected.get("hf_not_enough_recent_trades_per_week", 0) + 1
+            continue
+        if features.get("resolved_trade_count", 0) < hf_cfg.min_resolved_trades_hard:
+            rejected["hf_one_hit_wonder"] = rejected.get("hf_one_hit_wonder", 0) + 1
+            continue
+        if features.get("market_breadth", 0) < hf_cfg.min_market_breadth_hard:
+            rejected["hf_insufficient_market_breadth"] = rejected.get("hf_insufficient_market_breadth", 0) + 1
+            continue
+        if features["activity_pattern_label"] == "inconsistent_activity":
+            rejected["hf_no_readable_strategy"] = rejected.get("hf_no_readable_strategy", 0) + 1
+            continue
+
+        evaluation = evaluate_wallet(closed_positions, features)
+
+        wallet_record = _build_wallet_record(
+            wallet=wallet, entry=entry, features=features, evaluation=evaluation,
+            activity=activity, closed_positions=closed_positions, open_positions=open_positions,
+            closed_events_pool=closed_events_pool,
+        )
+        results.append(wallet_record)
+
+    # Rank by copy_trade_score so the best candidates lead, in case more
+    # than target_min_wallets qualified.
+    results.sort(key=lambda w: -(w.get("copy_trade_score") or 0))
+    return results, rejected
+
+
+def _build_wallet_record(wallet: str, entry: dict, features: dict, evaluation: dict,
+                          activity: list, closed_positions: list, open_positions: list,
+                          closed_events_pool: list = None) -> dict:
+    """
+    Adapter between features/wallet_features.py's canonical field names
+    (resolved_trade_count, market_breadth, avg_notional_usd - matching
+    storage/schemas.py's WalletProfile) and storage/db.py's wallet_candidates
+    table columns (resolved_count, distinct_events, avg_trade_size_usd, plus
+    win/loss counts and a plain-language behavioral_pattern string that
+    aren't computed elsewhere). Keeps features/*.py's output canonical while
+    this is where the richer per-wallet dossier gets assembled for storage
+    and Discord display.
+    """
+    wins = [p for p in closed_positions if p["realized_pnl"] > 0]
+    losses = [p for p in closed_positions if p["realized_pnl"] <= 0]
+    resolved_count = len(wins) + len(losses)
+    total_realized_pnl = sum(p["realized_pnl"] for p in closed_positions) if closed_positions else 0.0
+
+    trade_count = features.get("trade_count", 0)
+    pnl_lifetime = features.get("pnl_lifetime", entry.get("pnl", 0.0))
+    pnl_per_trade = round(pnl_lifetime / trade_count, 2) if trade_count else 0.0
+
+    notionals = [a["notional_usd"] for a in activity if a.get("notional_usd")]
+    largest_trade_usd = round(max(notionals), 2) if notionals else 0.0
+
+    open_exposure_usd = round(sum(p.get("current_value", 0.0) for p in open_positions), 2)
+
+    behavioral_pattern = _describe_behavior(
+        trades_per_day=features.get("trades_per_day", 0.0),
+        distinct_events=features.get("market_breadth", 0),
+        buy_ratio=features.get("buy_ratio"),
+        avg_trade_size_usd=features.get("avg_notional_usd", 0.0),
+        largest_trade_usd=largest_trade_usd,
+    )
+
+    record = {
+        "wallet_address": wallet, "username": entry.get("username"), "rank": entry.get("rank"),
+        "pnl": entry.get("pnl", 0.0), "vol": entry.get("vol", 0.0),
+        "trade_count": trade_count, "wallet_age_days": features.get("wallet_age_days", 0.0),
+        "pnl_per_trade": pnl_per_trade,
+        "wins": len(wins), "losses": len(losses), "resolved_count": resolved_count,
+        "win_rate": features.get("win_rate"), "avg_win": round(sum(p["realized_pnl"] for p in wins) / len(wins), 2) if wins else 0.0,
+        "avg_loss": round(sum(p["realized_pnl"] for p in losses) / len(losses), 2) if losses else 0.0,
+        "total_realized_pnl": round(total_realized_pnl, 2),
+        "trades_per_day": features.get("trades_per_day", 0.0),
+        "distinct_events": features.get("market_breadth", 0),
+        "top_events": features.get("top_events", []),
+        "buy_ratio": features.get("buy_ratio"),
+        "avg_trade_size_usd": features.get("avg_notional_usd", 0.0),
+        "largest_trade_usd": largest_trade_usd,
+        "behavioral_pattern": behavioral_pattern,
+        "open_positions_count": len(open_positions),
+        "open_exposure_usd": open_exposure_usd,
+        "behavior_label": evaluation.get("behavior_label"),
+        "copy_trade_score": evaluation.get("copy_trade_score"),
+        "copy_trade_score_10": evaluation.get("copy_trade_score_10"),
+        "copy_trade_recommendation": evaluation.get("copy_trade_recommendation"),
+        "copy_trade_recommendation_label": evaluation.get("copy_trade_recommendation_label"),
+        "why_copy_or_not": evaluation.get("why_copy_or_not"),
+        "biggest_win_usd": evaluation.get("biggest_win_usd", 0.0),
+        "biggest_loss_usd": evaluation.get("biggest_loss_usd", 0.0),
+        "recent_14d_summary": evaluation.get("recent_14d_summary"),
+        "sample_quality": evaluation.get("sample_quality"),
+        "trade_count_14d": features.get("trade_count_14d", 0),
+        "pnl_resolved_30d": features.get("pnl_resolved_30d", 0.0),
+        "category_performance": features.get("category_performance", {}),
+        "pnl_lifetime": pnl_lifetime,
+        "days_since_last_trade": features.get("days_since_last_trade"),
+        "is_system_contract": features.get("is_system_contract", False),
+        "system_contract_label": features.get("system_contract_label"),
+        "activity_pattern_label": features.get("activity_pattern_label", "unknown"),
+        "avg_active_days_per_week": features.get("avg_active_days_per_week", 0.0),
+        "is_bursty": features.get("is_bursty", False),
+        "luck_flags": evaluation.get("luck_flags", {}),
+        "entry_timing_label": features.get("entry_timing_label", "unknown"),
+        "timing_entropy": features.get("timing_entropy", 0.0),
+        "trades_per_day": features.get("trades_per_day", 0.0),
+        "drift_result": features.get("drift_result", {}),
+    }
+    record["transaction_blocks"] = explain_recent_trades(activity, max_trades=5)
+    record["contrarian_win"] = find_contrarian_big_win(closed_positions, activity, closed_events_pool)
+    record["market_options_breakdown"] = _build_market_options_breakdown(activity, open_positions)
+    record["full_report_text"] = render_wallet_report(record)
+    return record
+
+
+def _build_market_options_breakdown(activity: list, open_positions: list) -> str:
+    """
+    Phase 4 requirement: 'all available market options on the event and
+    the wallet's positions.' Uses the wallet's most recent trade's event
+    to fetch every outcome market Gamma has for that event, cross-
+    referenced against the wallet's actual open positions in it.
+
+    Matches on the position's specific market title/question, NOT just
+    the outcome label ("Yes"/"No") - those labels are shared across every
+    binary market in a multi-outcome event, so outcome-only matching would
+    incorrectly mark every market as "held" the moment the wallet holds
+    a "Yes" in just one of them.
+    """
+    if not activity:
+        return "No recent activity to determine an event."
+
+    most_recent = max(activity, key=lambda a: a.get("timestamp", 0))
+    event_slug = most_recent.get("event_slug")
+    if not event_slug:
+        return "Most recent trade has no associated event."
+
+    event = get_event_cached(event_slug)
+    if not event or not event.get("markets"):
+        return f"Could not fetch full market list for event '{event_slug}'."
+
+    held_titles = {
+        p.get("title") for p in open_positions
+        if p.get("event_slug") == event_slug and p.get("title")
+    }
+
+    lines = [f"Event: **{event.get('title', event_slug)}**"]
+    for m in event["markets"]:
+        question = m.get("question", "unknown outcome")
+        outcomes = m.get("outcomes") or []
+        prices = m.get("outcome_prices") or {}
+        held_marker = " ← wallet holds a position here" if question in held_titles else ""
+        price_str = ", ".join(f"{o}: {prices.get(o, 0):.2f}" for o in outcomes) if outcomes else "n/a"
+        lines.append(f"  - {question} ({price_str}){held_marker}")
+
+    return "\n".join(lines)
+
+
+def _describe_behavior(trades_per_day, distinct_events, buy_ratio, avg_trade_size_usd, largest_trade_usd) -> str:
+    concentration = "concentrated in a small handful of events" if distinct_events <= 3 else "diversified across many events"
+    if buy_ratio is None:
+        directionality = "unknown buy/sell mix"
+    elif buy_ratio >= 0.8:
+        directionality = "almost always opens new positions rather than exiting early"
+    elif buy_ratio <= 0.2:
+        directionality = "mostly exits/closes positions rather than opening fresh ones"
+    else:
+        directionality = "a balanced mix of opening and closing positions"
+
+    return (
+        f"Trades about {trades_per_day:.2f}x/day on average, {concentration} "
+        f"({distinct_events} distinct events), with {directionality}. "
+        f"Average trade size is roughly ${avg_trade_size_usd:,.0f}, with a "
+        f"largest single trade of ${largest_trade_usd:,.0f}."
+    )
+
+
+def _print_coverage_diagnostics(events: list, kalshi_markets: list, arb_signals: list, cross_signals: list):
+    """
+    Explains WHY categories with no signals have none - the two structural
+    reasons are (1) arbitrage only exists for neg-risk multi-outcome
+    groups, which most non-election/awards categories simply don't use,
+    and (2) Kalshi cross-platform matching failed to clear the similarity
+    threshold. This prints the best near-miss Kalshi score per category so
+    a persistent "0 signals" is diagnosable instead of a silent black box.
+    """
+    from collections import defaultdict
+
+    by_category = defaultdict(lambda: {"markets": 0, "neg_risk_markets": 0, "best_kalshi_score": 0.0})
+    for e in events:
+        cat = e.get("category", "unknown")
+        for m in e["markets"]:
+            by_category[cat]["markets"] += 1
+            if m.get("neg_risk"):
+                by_category[cat]["neg_risk_markets"] += 1
+            if kalshi_markets and m.get("liquidity", 0) >= 1:
+                _, score = find_best_kalshi_candidate(m, kalshi_markets)
+                by_category[cat]["best_kalshi_score"] = max(by_category[cat]["best_kalshi_score"], score)
+
+    print("\n--- CATEGORY COVERAGE DIAGNOSTICS ---")
+    for cat in sorted(by_category.keys()):
+        stats = by_category[cat]
+        note = ""
+        if stats["neg_risk_markets"] == 0 and stats["best_kalshi_score"] < 0.55:
+            note = " <- no neg-risk groups AND no Kalshi match above 0.55 this cycle: structurally no free signal source available"
+        print(f"  {cat}: {stats['markets']} market(s) scanned, {stats['neg_risk_markets']} in neg-risk groups, "
+              f"best Kalshi match score {stats['best_kalshi_score']:.2f}{note}")
+
+
+def _print_report_details(run_id: int, report_summaries: list):
+    if not report_summaries:
+        return
+    print(f"\n--- [run {run_id}] SIGNAL-BY-SIGNAL DETAIL ---")
+    for r in report_summaries:
+        status = "🔔 ALERTED" if r["will_alert"] else f"skipped ({r['skip_reason']})"
+        print(f"  [{r['edge_pp']:.1f}pp | {r['signal_type']}] {r['title']!r}")
+        print(f"      decision={r['decision']} confidence={r['confidence']} -> {status}")
+
+
+def _print_summary(run_id, events, kalshi_markets, signals, reports_built, alerts_sent):
+    print("\n" + "=" * 60)
+    print(f"SCAN RUN #{run_id} SUMMARY")
+    print("=" * 60)
+    print(f"Polymarket events scanned: {len(events)}")
+    print(f"Kalshi markets scanned:    {len(kalshi_markets)}")
+    print(f"Signals processed:         {len(signals)}")
+    print(f"Intelligence reports built:{reports_built}")
+    print(f"Discord alerts sent:       {alerts_sent}")
+    print("\nAll reports stored in the database for historical tracking.")
+    print("Reminder: these are research signals, not trade calls, and")
+    print("nothing here is financial advice.")
+
+
+def run_forever(categories: list, max_per_category: int, max_kalshi: int, interval_seconds: int):
+    print(f"Starting continuous scan loop (interval={interval_seconds}s). Ctrl+C to stop.")
+    cycle = 0
+    while True:
+        cycle += 1
+        run_wallet_scan = (cycle % WALLET_SCAN_EVERY_N_RUNS == 0)
+        try:
+            run_scan(categories=categories, max_per_category=max_per_category,
+                      max_kalshi=max_kalshi, include_wallet_scan=run_wallet_scan)
+        except Exception as e:
+            print(f"ERROR during scan (will retry next interval): {e}", file=sys.stderr)
+        print(f"\nSleeping {interval_seconds}s until next scan...\n")
+        time.sleep(interval_seconds)
+
+
+if __name__ == "__main__":
+    print_startup_report()  # shows which modules are paid/free and current settings
+
+    parser = argparse.ArgumentParser(description="Polymarket Alpha Intelligence Engine v2")
+    parser.add_argument("--categories", type=str, default=",".join(market_categories.categories_to_scan))
+    parser.add_argument("--max-events-per-category", type=int, default=market_categories.max_events_per_category)
+    parser.add_argument("--max-kalshi", type=int, default=MAX_KALSHI_PER_SCAN)
+    parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--interval", type=int, default=SCAN_INTERVAL_SECONDS)
+    parser.add_argument("--wallet-scan", action="store_true")
+    args = parser.parse_args()
+
+    categories = [c.strip() for c in args.categories.split(",") if c.strip()]
+
+    if args.loop:
+        run_forever(categories, args.max_events_per_category, args.max_kalshi, args.interval)
+    else:
+        run_scan(categories=categories, max_per_category=args.max_events_per_category,
+                  max_kalshi=args.max_kalshi, include_wallet_scan=args.wallet_scan)
