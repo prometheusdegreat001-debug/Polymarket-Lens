@@ -1,0 +1,102 @@
+min_sample_size: 3
+min_pnl_horizon_days: 30
+max_acceptable_drawdown_usd: 5000
+# "Preferred" statistical-relevance bar (not a hard filter - a wallet with
+# fewer resolved trades can still qualify, but the report explicitly flags
+# it as a smaller sample rather than silently treating it the same as a
+# wallet with 20 resolved trades).
+preferred_min_resolved_trades: 15
+weights:
+  # Matches the exact 5-factor table from the Wallet Intelligence Layer
+  # v2.4 spec. "address_type" is reinterpreted from a naive EOA-vs-contract
+  # check (which would incorrectly flag every Polymarket trader, since all
+  # user funds sit in per-user proxy wallet contracts by design) into: is
+  # this a known SHARED SYSTEM contract (relay hub, factory, pUSD, CTF)?
+  # "activity_consistency" blends real day-of-week spread with the
+  # recency-weighted engagement score (days since last trade, last-14-day
+  # trade count, last-30-day PnL sign).
+  address_type: 0.25
+  activity_consistency: 0.25
+  behavioral_quality: 0.20
+  risk_management: 0.15
+  evidence_of_edge: 0.15
+luck_penalty:
+  penalty_small_sample: 0.4
+  penalty_concentration: 0.3
+  penalty_drawdown: 0.2
+  max_concentration_share: 0.6
+copy_trade_score_threshold: 55   # 0-100, min score for "copy" recommendation
+leaderboard_pool_size: 100
+# Recent-window PnL ranking, NOT all-time. Ranking by all-time PnL surfaces
+# wallets that made a fortune years ago and went dormant - MONTH keeps the
+# candidate POOL itself biased toward currently-relevant performance,
+# rather than trying to filter stale wallets out after the fact.
+leaderboard_time_period: "MONTH"   # DAY | WEEK | MONTH | ALL
+max_trade_count_for_selectivity: 150
+min_wallet_age_days: 90
+min_pnl_usd: 2000
+taxonomy:
+  emotional_max_win_rate: 0.40         # win rate at/below this + high frequency -> emotional_trader
+  high_frequency_min_trades_per_day: 3.0
+  whale_min_avg_notional_usd: 10000
+  smart_money_min_win_rate: 0.60
+  smart_money_min_breadth: 3
+  specialist_max_breadth: 2
+activity_recency:
+  # HARD cutoff, checked at discovery time (main.py's leaderboard scan),
+  # not just at scoring time - an inactive wallet is excluded from the
+  # candidate pool entirely, never just downgraded. This value is NEVER
+  # loosened by the broaden-and-retry logic even when too few wallets
+  # qualify - recency is non-negotiable, unlike age/trade-count/PnL.
+  max_days_inactive: 14
+  # Wallets active within this tighter window get a small score bonus
+  # (see wallet_intel/wallet_scoring.py) - "ideally last 7 days."
+  ideal_days_inactive: 7
+  # Soft downgrade thresholds used by wallet_intel/copy_trade_filter.py as
+  # defense-in-depth, in case time passes between discovery and alerting.
+  max_days_dormant_for_copy: 14
+  max_days_dormant_for_watch: 45
+
+# Thresholds for the "Active Human Trader / Consistent Semi-Automated /
+# High-Frequency Bot / Inconsistent Activity" classification - distinct
+# from the taxonomy above (which is about trading SKILL; this is about
+# activity PATTERN / how human-like the cadence looks).
+activity_pattern:
+  min_active_days_per_week_consistent: 2.0   # "2-3 different days per week" requirement
+  bot_trades_per_day_min: 3.0
+  bot_timing_entropy_max: 0.25               # very low entropy = mechanical, same-hour-every-time pattern
+
+# Phase 2 hard filters (non-negotiable, checked at discovery time, before
+# any wallet reaches scoring). Distinct from preferred_min_resolved_trades
+# above (which is a soft "statistically meaningful" flag) - these three
+# are genuine exclusions.
+hard_filters:
+  min_trades_per_week_recent: 2.0    # over the most recent 4-week (28-day) window
+  min_resolved_trades_hard: 10       # absolute floor - excludes true "one-hit wonders"
+  min_market_breadth_hard: 3         # "consistent performance across multiple markets"
+  # "readable and interpretable strategy": a wallet classified as
+  # inconsistent_activity (bursty/sparse, no discernible pattern) fails
+  # this requirement outright - see wallet_intel.wallet_classifier.
+
+# A REPEATED low-entry-price, small-stake trading pattern ("longshot
+# specialist") - deliberately distinct from strategy_learning's
+# contrarian_win_finder (which looks for a single standout case-study
+# trade for manual review) and from lucky_wallet_detector (which flags
+# one-off luck). This is for wallets that show the pattern MULTIPLE times
+# with a capped stake each time - a real, repeatable style, not luck.
+#
+# Before this existed, wallets with exactly this pattern were being
+# silently dropped by hard_filters above: they naturally have fewer
+# resolved trades and sparser/burstier activity than a "consistent
+# trader" cadence produces, so they never reached scoring at all. This
+# gives them a parallel qualification path instead.
+longshot_pattern:
+  max_entry_price: 0.25      # crowd pricing the outcome at <=25% - same bar contrarian_win_finder uses
+  max_stake_usd: 100         # per-trade stake cap - "small, capped bets," not a whale swinging big on a longshot
+  min_qualifying_trades: 3   # must recur to count as a pattern, not a one-off
+  # Net PnL across just the qualifying longshot trades must be positive -
+  # this isn't trying to prove statistical edge off a tiny sample (that's
+  # not achievable at n=3), just to exclude a wallet that's simply lost
+  # money on longshots repeatedly (that's not a "pattern worth surfacing,"
+  # it's a losing habit).
+  min_net_pnl_usd: 0

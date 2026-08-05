@@ -1,0 +1,15 @@
+min_liquidity_usd: 1000
+min_volume_24h_usd: 500
+min_depth_usd: 500
+max_position_size_pct_of_bankroll: 5.0
+default_bankroll_usd: null   # null = sizing is shown as % only, never $
+edge_threshold_low: 0.05
+edge_threshold_high: 0.10
+# Master switch for the Kalshi cross-platform matching engine. Set to
+# false per the Phase 1 data-source restriction (Polymarket + free news
+# only, no cross-platform mirroring). Kept as a toggle rather than
+# deleting the matching engine outright - flip back to true if you later
+# want cross-platform coverage back for categories (crypto, weather, tech)
+# that have no other free signal source, since arbitrage signals are
+# structurally limited to neg-risk multi-outcome groups.
+enable_kalshi_cross_platform: false
