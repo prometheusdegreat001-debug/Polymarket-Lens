@@ -1,0 +1,30 @@
+# News ingestion + market-matching config. API keys themselves are NOT
+# here - they're environment variables only (see config/loader.py).
+
+newsdata:
+  enabled: true
+  max_articles_per_fetch: 50   # NewsData.io free tier: 50 results per request
+  language: "en"
+
+allnews:
+  enabled: true
+  max_articles_per_fetch: 30
+  # Response schema for api.allnewsapi.com specifically could not be
+  # confirmed against authoritative documentation (every search for
+  # "AllNewsAPI" surfaced OTHER, differently-branded news APIs instead -
+  # see ingestion/news_sources.py's docstring). The fetcher handles
+  # several plausible response shapes defensively rather than assuming
+  # one - if it doesn't match reality, it fails loudly (logged), not
+  # silently with fabricated data.
+
+# How far back an article counts as "fresh" for market matching.
+max_article_age_hours: 48
+
+# Minimum keyword-overlap ratio (same 0-1 scale as
+# ingestion/free_news_sources.py's existing matcher) for an article to be
+# considered relevant to a market at all.
+min_relevance_overlap: 0.15
+
+# Per-market cap on how many matched articles get stored/considered -
+# keeps a single viral story from dominating storage for one market.
+max_matches_per_market: 15

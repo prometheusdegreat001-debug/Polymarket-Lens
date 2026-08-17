@@ -1,0 +1,63 @@
+# Real Polymarket Gamma tag IDs (confirmed against Polymarket's own
+# open-source frontend code) - fast, verified static path.
+tag_ids:
+  politics: 2
+  crypto: 21
+  geopolitics: 100265
+  finance: 120
+  sports: 100639
+  tech: 1401
+  culture: 596
+
+# Categories beyond the verified static set above - resolved dynamically at
+# startup via the real Gamma /tags endpoint (ingestion/category_resolver.py),
+# not hardcoded, since these numeric IDs aren't independently confirmed.
+# Any that can't be found are skipped with a warning rather than guessed.
+#
+# Note on "Perps": Polymarket doesn't offer true perpetual futures (that's
+# a different product - dYdX/GMX/Hyperliquid). The closest analog is
+# short-horizon crypto up/down markets, already covered under "crypto"
+# above - there's no separate perps tag to add.
+dynamic_categories:
+  - iran
+  - middle_east
+  - weather
+  - elections
+  - breaking_news
+  - economy
+  - esports   # confirmed real Gamma category (also a distinct leaderboard
+              # category enum: ESPORTS) - was missing entirely before, in
+              # both the static and dynamic lists, so esports markets were
+              # never scanned for mispricing regardless of activity level.
+
+categories_to_scan:
+  - politics
+  - crypto
+  - sports
+  - geopolitics
+  - finance
+  - tech
+  - culture
+  - iran
+  - middle_east
+  - weather
+  - elections
+  - breaking_news
+  - economy
+  - esports
+# Raised from 60: with fetch_active_events/fetch_closed_events now doing
+# REAL offset pagination (see ingestion/polymarket_api.py) instead of
+# silently capping at one ~100-event page regardless of this number, this
+# value finally does what it always claimed to - actually caps real
+# per-category coverage, not just the first page of it.
+max_events_per_category: 300
+
+# Only scan markets resolving within this many days - explicit user
+# preference for daily/weekly trading, not months-out positions. A market
+# resolving in 2027, or even 3 months out, isn't a "daily or weekly
+# opportunity" no matter how good its pricing looks - it's excluded
+# entirely before any mispricing/wallet/news analysis even runs on it,
+# not just deprioritized. Markets with no parseable end_date are excluded
+# too - if we can't confirm a market is near-term, we don't scan it,
+# rather than assuming it's fine.
+max_days_to_resolution: 14
